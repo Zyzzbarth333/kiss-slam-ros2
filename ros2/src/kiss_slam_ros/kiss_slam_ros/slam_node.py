@@ -1408,14 +1408,26 @@ class SLAMNode(Node):
         self.get_logger().info(f"Status saved: {status_path}")
 
         # 2. Copy FLIO PCD into session directory (MUST be before presentation map)
+        #    FAST-LIO saves on SIGINT via its destructor, which races with this
+        #    shutdown handler.  Wait for the file mtime to be AFTER node start
+        #    so we don't copy a stale PCD from a previous run.
         import shutil
         import time as _time
         flio_pcd_src = os.path.expanduser(
             '~/Documents/theseus_autonomy_ws/data/maps/hardware/flio_map.pcd')
         flio_pcd_dst = os.path.join(self._save_dir, 'flio_map.pcd')
-        for attempt in range(10):
+        for attempt in range(20):  # up to ~10s
             if os.path.exists(flio_pcd_src):
                 try:
+                    src_mtime = os.path.getmtime(flio_pcd_src)
+                    if src_mtime < self._start_time:
+                        # Stale file from a previous run — keep waiting
+                        self.get_logger().info(
+                            f"FLIO PCD stale (mtime {src_mtime:.0f} < start {self._start_time:.0f}), "
+                            f"waiting... ({attempt + 1}/20)")
+                        _time.sleep(0.5)
+                        continue
+                    # File is fresh — wait for size to stabilise
                     src_size = os.path.getsize(flio_pcd_src)
                     _time.sleep(0.5)
                     if os.path.getsize(flio_pcd_src) == src_size:
@@ -1428,7 +1440,7 @@ class SLAMNode(Node):
             _time.sleep(0.5)
         else:
             self.get_logger().warn(
-                f"FLIO PCD not found at {flio_pcd_src} after 5s")
+                f"FLIO PCD not found or still stale at {flio_pcd_src} after 10s")
 
         # 3. Composite annotated map (debug backup)
         try:
