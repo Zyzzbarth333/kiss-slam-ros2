@@ -16,6 +16,12 @@ from sensor_msgs_py import point_cloud2 as pc2
 import tf2_ros
 from kiss_slam_ros.utils.config import declare_parameters, get_kiss_icp_config
 
+# Timestamp field names to search for, in priority order.
+# LIVOX MID-360 PointXYZRTLT uses 'timestamp' (float64).
+# Ouster / Velodyne / Gazebo typically use 't' (float32/float64).
+# Some drivers use 'time' or 'time_stamp'.
+_TIMESTAMP_FIELDS = ('t', 'timestamp', 'time', 'time_stamp')
+
 
 class OdometryNode(Node):
     def __init__(self):
@@ -31,11 +37,15 @@ class OdometryNode(Node):
         # Core Odometry component
         self.odometry = KissICP(config)
 
+        # Detected timestamp field name (resolved on first message)
+        self._ts_field = None
+        self._ts_field_resolved = False
+
         # ROS Communications
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         self._init_publishers()
         self._init_subscribers()
-        
+
         self.get_logger().info(
             f"Odometry Node initialized with odom_frame: {self.odom_frame}, base_frame: {self.base_frame}"
         )
@@ -43,40 +53,64 @@ class OdometryNode(Node):
 
     def _init_publishers(self):
         """Initialize all ROS publishers."""
-        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, durability=DurabilityPolicy.VOLATILE, depth=10)
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            durability=DurabilityPolicy.VOLATILE,
+            depth=10,
+        )
         self.deskewed_pub = self.create_publisher(PointCloud2, 'deskewed_points', qos)
         self.odom_pub = self.create_publisher(Odometry, 'odometry', qos)
 
     def _init_subscribers(self):
         """Initialize subscribers."""
-        qosb_profile = QoSProfile(
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
-            durability=DurabilityPolicy.VOLATILE
+            durability=DurabilityPolicy.VOLATILE,
         )
-        qosr_profile = QoSProfile(
-            history=HistoryPolicy.KEEP_ALL,          # never drop old messages
-            reliability=ReliabilityPolicy.RELIABLE,  # retry until ACK
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,  # late-joining subscribers still get the backlog
+        self.create_subscription(
+            PointCloud2, '/points_raw', self.listener_callback, qos
         )
 
-        self.create_subscription(
-            PointCloud2, '/points_raw', self.listener_callback, qosb_profile
-        )
+    def _resolve_timestamp_field(self, msg_fields: dict):
+        """Detect the per-point timestamp field on the first message."""
+        for candidate in _TIMESTAMP_FIELDS:
+            if candidate in msg_fields:
+                self._ts_field = candidate
+                self.get_logger().info(
+                    f"Deskew: using per-point timestamp field '{candidate}'"
+                )
+                break
+        if self._ts_field is None:
+            self.get_logger().warn(
+                f"No per-point timestamp field found (checked {_TIMESTAMP_FIELDS}). "
+                f"Available fields: {list(msg_fields.keys())}. "
+                f"Deskewing will be disabled."
+            )
+        self._ts_field_resolved = True
 
     def listener_callback(self, msg: PointCloud2):
-        """
-        Main callback for processing point cloud data and publishing odometry.
-        """
+        """Main callback for processing point cloud data and publishing odometry."""
         msg_fields = {field.name: field for field in msg.fields}
-        if 't' in msg_fields:
-            points_np = pc2.read_points(msg, field_names=("x", "y", "z", "t"), skip_nans=True)
-            timestamps = points_np['t'].astype(np.float64)
+
+        # Resolve timestamp field once
+        if not self._ts_field_resolved:
+            self._resolve_timestamp_field(msg_fields)
+
+        # Extract points + timestamps
+        if self._ts_field is not None:
+            points_np = pc2.read_points(
+                msg, field_names=("x", "y", "z", self._ts_field), skip_nans=True
+            )
+            timestamps = points_np[self._ts_field].astype(np.float64)
         else:
-            points_np = pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
+            points_np = pc2.read_points(
+                msg, field_names=("x", "y", "z"), skip_nans=True
+            )
             timestamps = np.array([])
-            
+
         points = np.vstack([points_np['x'], points_np['y'], points_np['z']]).T.astype(np.float64)
 
         # Run KISS-ICP odometry
@@ -87,7 +121,7 @@ class OdometryNode(Node):
         self._publish_transform(current_odom_pose, msg.header.stamp, self.odom_frame, self.base_frame)
         self._publish_odometry(current_odom_pose, msg.header.stamp, self.odom_frame, self.base_frame)
         self._publish_deskewed_points(deskewed_frame, msg.header.stamp)
-    
+
     def _publish_transform(self, pose: np.ndarray, stamp, frame_id: str, child_frame_id: str):
         t = TransformStamped()
         t.header.stamp = stamp
@@ -109,8 +143,7 @@ class OdometryNode(Node):
         odom.header.stamp = stamp
         odom.header.frame_id = frame_id
         odom.child_frame_id = child_frame_id
-        
-        # Set pose
+
         odom.pose.pose.position.x = pose[0, 3]
         odom.pose.pose.position.y = pose[1, 3]
         odom.pose.pose.position.z = pose[2, 3]
@@ -119,31 +152,14 @@ class OdometryNode(Node):
         odom.pose.pose.orientation.y = quat[1]
         odom.pose.pose.orientation.z = quat[2]
         odom.pose.pose.orientation.w = quat[3]
-        
-        # Set covariance constants for now
-        odom.pose.covariance[0] = 0.1  # x
-        odom.pose.covariance[7] = 0.1  # y
+
+        odom.pose.covariance[0] = 0.1   # x
+        odom.pose.covariance[7] = 0.1   # y
         odom.pose.covariance[14] = 0.1  # z
         odom.pose.covariance[21] = 0.1  # roll
         odom.pose.covariance[28] = 0.1  # pitch
         odom.pose.covariance[35] = 0.1  # yaw
-        
-        # Set twist, zero for now
-        odom.twist.twist.linear.x = 0.0
-        odom.twist.twist.linear.y = 0.0
-        odom.twist.twist.linear.z = 0.0
-        odom.twist.twist.angular.x = 0.0
-        odom.twist.twist.angular.y = 0.0
-        odom.twist.twist.angular.z = 0.0
-        
-        # Set twist covariance (constants for now)
-        odom.twist.covariance[0] = 0.1  # linear x
-        odom.twist.covariance[7] = 0.1  # linear y
-        odom.twist.covariance[14] = 0.1  # linear z
-        odom.twist.covariance[21] = 0.1  # angular x
-        odom.twist.covariance[28] = 0.1  # angular y
-        odom.twist.covariance[35] = 0.1  # angular z
-        
+
         self.odom_pub.publish(odom)
 
     def _publish_deskewed_points(self, deskewed_frame: np.ndarray, stamp):
@@ -151,11 +167,7 @@ class OdometryNode(Node):
         header = std_msgs.msg.Header()
         header.stamp = stamp
         header.frame_id = self.base_frame
-
-        # Convert deskewed_frame to PointCloud2 message
         deskewed_cloud = pc2.create_cloud_xyz32(header, deskewed_frame[:, :3])
-
-        # Publish the deskewed point cloud
         self.deskewed_pub.publish(deskewed_cloud)
 
     def destroy_node(self):

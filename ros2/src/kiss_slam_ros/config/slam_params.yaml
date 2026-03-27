@@ -4,9 +4,19 @@ slam_node:
     map_frame: "map"
     odom_frame: "odom"
     base_frame: "base_link"
-    
+
     # SLAM-specific parameters
     kiss_slam:
+      # Odometry preprocessing — needed so occupancy_mapper.max_range
+      # inherits the correct sensor range (40m) instead of the default 100m.
+      # The SLAM node doesn't run its own KISS-ICP, but the config loader
+      # uses odometry.preprocessing.max_range as the fallback for
+      # occupancy_mapper.max_range when max_range is set to -1.0 below.
+      odometry:
+          preprocessing:
+              max_range: 40.0   # MID-360 spec
+              min_range: 0.0
+
       local_mapper:
           voxel_size: 0.2
           splitting_distance: 5.0
@@ -15,13 +25,9 @@ slam_node:
           free_threshold: 0.5
           occupied_threshold: 0.7
           resolution: 0.2
-          max_range: -1.0  # -1.0 represents null
-          z_min: 0.1
-          z_max: 0.5
-        
-      mapping:
-          voxel_size: -1.0  # -1.0 represents null
-          max_points_per_voxel: 20
+          max_range: -1.0       # Inherits from odometry.preprocessing.max_range (40.0)
+          z_min: 0.10
+          z_max: 0.50
 
       loop_closer:
           detector:
