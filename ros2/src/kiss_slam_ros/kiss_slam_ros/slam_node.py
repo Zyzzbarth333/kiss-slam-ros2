@@ -1297,22 +1297,37 @@ class SLAMNode(Node):
         voxels = active_voxels[z_mask]
         occs = occ_values[z_mask]
 
-        # B2: Stable origin
+        # B2: Stable origin — clamp grid to arena bounds when available
         xy = voxels[:, :2]
-        data_lower = np.min(xy, axis=0)
-        data_upper = np.max(xy, axis=0)
-        PAD = 20
-        if self._og_origin is None:
-            self._og_origin = data_lower - PAD
-            self._og_size = tuple((data_upper - self._og_origin + 1 + PAD).astype(int))
-        else:
-            new_lower = np.minimum(self._og_origin, data_lower - PAD)
-            old_upper = self._og_origin + np.array(self._og_size)
-            new_upper = np.maximum(old_upper, data_upper + 1 + PAD)
-            self._og_origin = new_lower
-            self._og_size = tuple((new_upper - new_lower).astype(int))
 
-        nx, ny = self._og_size
+        if self._arena_config and 'arena' in self._arena_config:
+            # Fixed grid covering exactly the arena, with a 1-cell wall band
+            a = self._arena_config['arena']
+            WALL_CELLS = int(math.ceil(1.0 / res))  # 1m wall band in cells
+            arena_x_min_vox = int(math.floor(a['x_min'] / res)) - WALL_CELLS
+            arena_x_max_vox = int(math.ceil(a['x_max'] / res)) + WALL_CELLS
+            arena_y_min_vox = int(math.floor(a['y_min'] / res)) - WALL_CELLS
+            arena_y_max_vox = int(math.ceil(a['y_max'] / res)) + WALL_CELLS
+            self._og_origin = np.array([arena_x_min_vox, arena_y_min_vox])
+            nx = arena_x_max_vox - arena_x_min_vox
+            ny = arena_y_max_vox - arena_y_min_vox
+            self._og_size = (nx, ny)
+        else:
+            # No arena config — grow dynamically (original behaviour)
+            data_lower = np.min(xy, axis=0)
+            data_upper = np.max(xy, axis=0)
+            PAD = 20
+            if self._og_origin is None:
+                self._og_origin = data_lower - PAD
+                self._og_size = tuple((data_upper - self._og_origin + 1 + PAD).astype(int))
+            else:
+                new_lower = np.minimum(self._og_origin, data_lower - PAD)
+                old_upper = self._og_origin + np.array(self._og_size)
+                new_upper = np.maximum(old_upper, data_upper + 1 + PAD)
+                self._og_origin = new_lower
+                self._og_size = tuple((new_upper - new_lower).astype(int))
+            nx, ny = self._og_size
+
         n_cells = int(nx) * int(ny)
         x_rel = (xy[:, 0] - self._og_origin[0]).astype(int)
         y_rel = (xy[:, 1] - self._og_origin[1]).astype(int)
@@ -1331,6 +1346,24 @@ class SLAMNode(Node):
         observed = np.isfinite(max_occ)
         grid[observed & (max_occ < free_thresh)] = 0
         grid[observed & (max_occ > occ_thresh)] = 100
+
+        # Arena boundary wall: mark cells outside nav_bounds as occupied (100)
+        if self._arena_config and 'arena' in self._arena_config:
+            a = self._arena_config['arena']
+            nav_x_min_vox = int(math.floor(a['x_min'] / res))
+            nav_x_max_vox = int(math.ceil(a['x_max'] / res))
+            nav_y_min_vox = int(math.floor(a['y_min'] / res))
+            nav_y_max_vox = int(math.ceil(a['y_max'] / res))
+            grid_2d = grid.reshape((ny, nx))
+            gx_vox = self._og_origin[0] + np.arange(nx)
+            gy_vox = self._og_origin[1] + np.arange(ny)
+            outside_x = (gx_vox < nav_x_min_vox) | (gx_vox >= nav_x_max_vox)
+            outside_y = (gy_vox < nav_y_min_vox) | (gy_vox >= nav_y_max_vox)
+            # Rows entirely outside Y bounds
+            grid_2d[outside_y, :] = 100
+            # Columns entirely outside X bounds
+            grid_2d[:, outside_x] = 100
+            grid = grid_2d.ravel()
 
         n_free = int(np.sum(grid == 0))
         n_occ = int(np.sum(grid == 100))
@@ -1393,7 +1426,7 @@ class SLAMNode(Node):
         except OSError:
             pass
 
-        # 1. Save status
+        # 1. Save status (instant)
         status_path = os.path.join(self._save_dir, 'slam_status.json')
         status = {
             'local_maps': len(self.voxel_maps),
@@ -1407,7 +1440,28 @@ class SLAMNode(Node):
             json.dump(status, f, indent=2)
         self.get_logger().info(f"Status saved: {status_path}")
 
-        # 2. Copy FLIO PCD into session directory (MUST be before presentation map)
+        # 2. Save nav2-compatible .pgm/.yaml map (instant, from cached grid)
+        try:
+            self._save_nav2_map()
+        except Exception as e:
+            import traceback
+            self.get_logger().error(f"Nav2 map save failed: {e}\n{traceback.format_exc()}")
+
+        # 3. Composite annotated map (fast, uses in-memory data)
+        try:
+            self._generate_composite_map()
+        except Exception as e:
+            import traceback
+            self.get_logger().error(f"Composite map failed: {e}\n{traceback.format_exc()}")
+
+        # 4. Mission report (instant)
+        try:
+            self._generate_mission_report()
+        except Exception as e:
+            import traceback
+            self.get_logger().error(f"Mission report failed: {e}\n{traceback.format_exc()}")
+
+        # 5. Copy FLIO PCD into session directory (SLOW — waits up to 10s)
         #    FAST-LIO saves on SIGINT via its destructor, which races with this
         #    shutdown handler.  Wait for the file mtime to be AFTER node start
         #    so we don't copy a stale PCD from a previous run.
@@ -1421,19 +1475,17 @@ class SLAMNode(Node):
                 try:
                     src_mtime = os.path.getmtime(flio_pcd_src)
                     if src_mtime < self._start_time:
-                        # Stale file from a previous run — keep waiting
                         self.get_logger().info(
                             f"FLIO PCD stale (mtime {src_mtime:.0f} < start {self._start_time:.0f}), "
                             f"waiting... ({attempt + 1}/20)")
                         _time.sleep(0.5)
                         continue
-                    # File is fresh — wait for size to stabilise
                     src_size = os.path.getsize(flio_pcd_src)
                     _time.sleep(0.5)
                     if os.path.getsize(flio_pcd_src) == src_size:
                         shutil.copy2(flio_pcd_src, flio_pcd_dst)
                         self.get_logger().info(
-                            f"FLIO PCD ({src_size / 1e6:.1f} MB) \u2192 {flio_pcd_dst}")
+                            f"FLIO PCD ({src_size / 1e6:.1f} MB) → {flio_pcd_dst}")
                         break
                 except Exception as e:
                     self.get_logger().warn(f"FLIO PCD copy attempt {attempt}: {e}")
@@ -1442,30 +1494,94 @@ class SLAMNode(Node):
             self.get_logger().warn(
                 f"FLIO PCD not found or still stale at {flio_pcd_src} after 10s")
 
-        # 3. Composite annotated map (debug backup)
-        try:
-            self._generate_composite_map()
-        except Exception as e:
-            import traceback
-            self.get_logger().error(f"Composite map failed: {e}\n{traceback.format_exc()}")
-
-        # 4. Presentation map from FLIO PCD (slide-ready, SIGINT-safe)
+        # 6. Presentation map from FLIO PCD (needs PCD from step 5)
         try:
             self._generate_presentation_map()
         except Exception as e:
             import traceback
             self.get_logger().error(f"Presentation map failed: {e}\n{traceback.format_exc()}")
 
-        # 5. Mission report
-        try:
-            self._generate_mission_report()
-        except Exception as e:
-            import traceback
-            self.get_logger().error(f"Mission report failed: {e}\n{traceback.format_exc()}")
+        # 7. Pull ArUco captures from Jetson into session folder
+        self._pull_jetson_captures()
 
-        # 6. Rsync session folder to laptop (blocks until complete)
+        # 8. Rsync session folder to laptop (blocks until complete)
         if self._sync_destinations:
             self._sync_to_laptop()
+
+    def _save_nav2_map(self):
+        """Save the last occupancy grid as a nav2-compatible .pgm + .yaml pair."""
+        msg = self._last_occupancy_msg
+        if msg is None:
+            self.get_logger().warn("No occupancy grid to save — skipping nav2 map")
+            return
+
+        width = msg.info.width
+        height = msg.info.height
+        res = msg.info.resolution
+        origin_x = msg.info.origin.position.x
+        origin_y = msg.info.origin.position.y
+
+        # Convert OccupancyGrid data to PGM pixels
+        # OccupancyGrid: -1=unknown, 0=free, 100=occupied
+        # PGM (nav2 convention): 254=free, 0=occupied, 205=unknown
+        import struct
+        pixels = bytearray(width * height)
+        for i, val in enumerate(msg.data):
+            if val < 0:
+                pixels[i] = 205  # unknown
+            else:
+                pixels[i] = max(0, min(254, 254 - int(val * 254 / 100)))
+
+        # PGM is stored top-row-first, OccupancyGrid is bottom-row-first
+        flipped = bytearray(width * height)
+        for row in range(height):
+            src_start = row * width
+            dst_start = (height - 1 - row) * width
+            flipped[dst_start:dst_start + width] = pixels[src_start:src_start + width]
+
+        pgm_path = os.path.join(self._save_dir, 'map.pgm')
+        yaml_path = os.path.join(self._save_dir, 'map.yaml')
+
+        with open(pgm_path, 'wb') as f:
+            header = f"P5\n{width} {height}\n255\n"
+            f.write(header.encode('ascii'))
+            f.write(flipped)
+
+        with open(yaml_path, 'w') as f:
+            f.write(f"image: map.pgm\n")
+            f.write(f"resolution: {res}\n")
+            f.write(f"origin: [{origin_x}, {origin_y}, 0.0]\n")
+            f.write(f"negate: 0\n")
+            f.write(f"occupied_thresh: 0.65\n")
+            f.write(f"free_thresh: 0.196\n")
+
+        pgm_size = os.path.getsize(pgm_path)
+        self.get_logger().info(
+            f"Nav2 map saved: {pgm_path} ({width}x{height}, {res}m/px, {pgm_size/1e3:.0f} KB)")
+
+    def _pull_jetson_captures(self):
+        """Pull ArUco snapshots from Jetson into the session folder."""
+        import subprocess
+        jetson_src = 'uqs@192.168.10.3:/home/uqs/ros2_ws/aruco_captures/'
+        local_dst = os.path.join(self._save_dir, 'aruco_captures/')
+        try:
+            result = subprocess.run(
+                ['rsync', '-az',
+                 '-e', 'ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no',
+                 jetson_src, local_dst],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                n = len(os.listdir(local_dst)) if os.path.isdir(local_dst) else 0
+                self.get_logger().info(f"Pulled {n} ArUco captures from Jetson")
+            else:
+                self.get_logger().warn(f"Jetson capture pull failed: {result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            self.get_logger().warn("Jetson capture pull timed out (3s)")
+        except FileNotFoundError:
+            self.get_logger().warn("rsync not available — skipping Jetson capture pull")
+        except Exception as e:
+            self.get_logger().warn(f"Jetson capture pull error: {e}")
 
     def _sync_to_laptop(self):
         """Rsync session folder to laptop. Tries each destination until one works."""
